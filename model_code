@@ -1,0 +1,233 @@
+#### empty environment and set wd ##################
+# remove data from the environment
+
+rm(list=ls())
+
+setwd("C:/your_directory/")
+
+# index (to be changed if run locally or in parallel)
+SIMID = 1
+
+# creation of the outfile
+outfile = paste0("output/", "sim_", sprintf("%06.0f", SIMID), ".rds") 
+if(file.exists(outfile)) stop("Already done") # only need this if one run fails when running in parallel
+
+sim_spread = function(simID=1, repID=1,
+                      discoveryYear = 1, additionalYears=2,
+                      managementGoal = "none"){
+  
+  require(raster)
+  require(rgeos)
+  require(data.table)
+  require(proxy)
+  require(ggplot2)
+  require(RColorBrewer)
+  require(readr)
+  require(dplyr)
+  require(lvec)
+  require(reshape2)
+  library(mvtnorm)
+  library(sf)
+  library(reldist)
+  
+  # loading landscape as geotif raster and transform it into data.table for modelling
+  rb=stack("inputs/SAIR_UK.tif") # background map
+
+  # setting coordinate system
+  crs(rb)<-"+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy
++towgs84=446.448,-125.157,542.06,0.1502,0.247,0.8421,-20.4894 +units=m +no_defs"
+  
+  df<- as.data.table(rasterToPoints(rb))
+  setnames(df,3:8,c("cover","cover_rank","K","avTsum_chess_avStrain","county","tree_density"))
+  
+  message("Starting simulation ", simID, "...")
+  
+ # setting number of years for the simulation 
+  number_of_years = discoveryYear+additionalYears
+  
+  gridRes = 0.2 # grid resolution in km
+  maxTrees = round(df$tree_density * gridRes^2) # maximum number of trees per grid cell 
+  df[,("numTrees") := K*maxTrees] # number of trees per grid cell
+  
+  # setting up a vector of random initialisation points stratified by county (10% of the susceptible cells per county)
+  # this allows the parallel indexed run according to this initialisation vector
+
+  vec_initPt<-vector("list",length = 62)
+  for (i in 1:62) {
+    set.seed(10) # set random number seed to the replicate ID (all scenarios will be run with the same replicate numbers)
+    init = sample(which(df[,county==i]&df[,numTrees]>0),size=round(length(which(df[,county==i]&df[,numTrees]>0))*10/100))
+    vec_initPt[[i]]<-c(init)
+  }
+  vec_initPt<-unlist(vec_initPt)
+  chunk_init=seq(chunk(vec_initPt, chunk_size = 31)[[SIMID]][1],chunk(vec_initPt, chunk_size = 31)[[SIMID]][2])
+  
+  # draw model parameters
+  paramSEAIR = readr::read_csv("inputs/paramSEAIR.csv") # parameters file from this study and Chapman et al. 2025
+  param = apply(paramSEAIR, 2, mean)
+  abc_posterior = readr::read_csv("inputs/xylella_posterior_basic_abc.csv") # parameters from White et al. 2020
+  param2 = apply(abc_posterior, 2, median) # use posterior median
+  df[,("beta") := param["beta"]*df$avTsum_chess_avStrain] # newly estimated force of infection for GB
+  
+  # add columns to df to store model state
+  df[, ('susceptible') := numTrees] # current grid cell susceptibles
+  df[, ('asymptomatic') := 0] # current grid cell asymptomatics 
+  # trees: 4 years fully infected and infectious before being removed (i.e. desiccated)
+  df[, ('infected1') := 0] # current grid cell symptomatics and fully infectious
+  df[, ('infected2') := 0] # current grid cell symptomatics and fully infectious
+  df[, ('infected3') := 0] # current grid cell symptomatics and fully infectious
+  df[, ('infected') := 0] # current grid cell symptomatics and fully infectious
+  df[, ('removed') := 0] # current grid cell removed
+  
+  df[, ('year_infected') := -1] # year grid cell is infected (-1 if not infected)
+  df[, ('year_detected') := -1] # year Xf is detected in a grid cell (-1 if not detected) 
+  df[, ('felled') := 0] # proportion of grid cell subject to felling
+  
+  # initialise an infection  
+  # initPt = cellFromXY(rb, c(0,0)) # one location c(x,y) vector of coordinates
+  # initPt = sample(which(df$county==39),1) # one location choosing county
+  initPt = vec_initPt[chunk_init][repID] # initialisation according to the index from the vector of random initialisation points
+  i0 = 1 # initial infection proportion of 0.005 (i.e. one single tree)
+  
+  # updating the state after initialisation
+  df[initPt, asymptomatic := i0]
+  df[initPt, susceptible := susceptible - i0 ] # assign initial susceptible population
+  df[initPt, year_infected := 0 ] # assign initial year infected
+  
+  # matrices to store annual infection...
+  mAsym = matrix(NA, nrow=nrow(df), ncol=number_of_years) # asymptomatic 
+  colnames(mAsym) = paste0("asymptomatic_", 1:number_of_years)
+  mInf1 = matrix(NA, nrow=nrow(df), ncol=number_of_years) # infected1 
+  colnames(mInf1) = paste0("infected1_", 1:number_of_years)
+  mInf2 = matrix(NA, nrow=nrow(df), ncol=number_of_years) # infected 2
+  colnames(mInf2) = paste0("infected2_", 1:number_of_years)
+  mInf3 = matrix(NA, nrow=nrow(df), ncol=number_of_years) # infected 3
+  colnames(mInf3) = paste0("infected3_", 1:number_of_years)
+  mInf = matrix(NA, nrow=nrow(df), ncol=number_of_years) # infected 
+  colnames(mInf) = paste0("infected_", 1:number_of_years)
+  mRem = matrix(NA, nrow=nrow(df), ncol=number_of_years) # removed
+  colnames(mRem) = paste0("removed_",1:number_of_years)
+  
+  # clear old plots from the R graphics window
+  try(dev.off(), silent=TRUE)
+    
+  # run the spread simulation over the specified number of years...
+  for(year in 1:number_of_years){ # number_of_years
+    
+    message("\n     Starting year ", year,  
+            " at ", Sys.time(),
+            " - ", round(sum(df[,asymptomatic+infected+infected1+infected2+infected3+removed]),1), " trees in ", 
+            sum(df[,asymptomatic+infected+infected1+infected2+infected3+removed]>0), " grid cells infected")
+    
+    # 1 - Grow local infection growth in each grid cell using discretised SIR model...
+    		# parameters can be changed here "param["xxx"]" according to the type of simulation (e.g. Puglia vs GB) 
+    
+    StoA = df[,susceptible] * (1 - exp(df[,-(beta*(infected+infected1+infected2+infected3) + param["ba"]*beta*asymptomatic + param["br"]*beta*removed)/numTrees]))
+    StoA[df[,numTrees]==0] = 0
+    
+    AtoI1 = df[,asymptomatic] * (1-exp(-1/(param["wI_GB2"]*param["Ta"])))
+    
+    I1toI2= df[,infected1]
+    I2toI3= df[,infected2]
+    I3toI= df[,infected3]
+    
+    ItoR = df[,infected]* (1-exp(-1/(param["wR_GB2"]*param["Td"])))
+    
+    # updating the compartments
+    df[,susceptible  := susceptible  - StoA]
+    df[,asymptomatic := asymptomatic + StoA - AtoI1]
+    df[,infected1 := AtoI1]
+    df[,infected2 := I1toI2]
+    df[,infected3 := I2toI3]
+    df[,infected  := infected + I3toI - ItoR]
+    df[,removed   := removed + ItoR]
+    
+    # 2 - Infection of new grid cells by stochastic dispersal, representing vector random dispersal
+
+    sourceXY = df[asymptomatic+infected+infected1+infected2+infected3>0, c("x","y")] # coords of sources
+    uninfectedIdx = which(df[,asymptomatic+infected+infected1+infected2+infected3]==0 & 
+                            df[,susceptible]>0 & df[,K]>0) # index for grid cells not infected but vulnerable
+    if(nrow(sourceXY) > 0 & length(uninfectedIdx) > 0){
+
+      # make chunks for processing the uninfected grid cells 
+      chunksize = ceiling(3e7 / nrow(sourceXY)) # set chunk size so it allows ~0.25Gb of RAM to DM # round(length(uninfectedIdx)/201)
+      br = seq(1, chunksize+length(uninfectedIdx), chunksize)
+      numChunks = length(br)-1
+      chunk = cut(1:length(uninfectedIdx), br, include.lowest=TRUE, labels=1:numChunks)
+     
+      # calc probability of a single tree becoming infected, by chunk
+      df[, ("prColonisation") := 0]
+      PrNewInfection_tree = lapply(1:numChunks, function(j){
+        # cat(ifelse(j==1, "", "\r"), round(100*j/numChunks), "% done         ")
+        
+        # index for uninfected grid cells in the chunk 
+        idx = uninfectedIdx[chunk==j]
+        # distance matrix in km
+        DM = proxy::dist(df[idx,c("x","y")], sourceXY, method="Euclidean") # / 1000
+
+        ## kernels
+        # SDD by diffusion
+        kShort = exp((DM^2)/(-2*(1000*param2["d50_short"])^2)) 
+        # LDD by exponential jumps in random direction
+        kLong = exp(DM/(-1000*param2["d50_long"])) 
+        kBoth = (1-param["alpha"])*kShort + param["alpha"]*kLong # combined 2d kernel
+        # transmission rate summed over all sources at distance
+        summedTransmission = kBoth %*% df[asymptomatic+infected+infected1+infected2+infected3>0, (beta*(infected+infected1+infected2+infected3) + param["ba"]*beta*asymptomatic + param["br"]*beta*removed)/numTrees] # sum of kernel * infectiveness over all sources
+        pInf = 1 - exp(-summedTransmission) # probability an individual tree is infected from any infective source
+        return(pInf)
+      })
+      PrNewInfection_tree = unlist(PrNewInfection_tree) # convert from list to vector
+      df[uninfectedIdx, prColonisation := PrNewInfection_tree] # store the colonisation probability
+      rm(PrNewInfection_tree)
+      rm(sourceXY)
+      rm(chunk)
+    }
+    
+    # 3 - generate new infections
+    # Binomial trials with individual tree infection probability
+    newInfections = rbinom(n=nrow(df), size=round(df[,susceptible]), prob=df[,prColonisation]) # number of new infections per grid cell
+    message(sum(newInfections>0), " new infections")
+    newInfections[newInfections > df[,susceptible]] = df[newInfections>susceptible ,susceptible] # ensure no new infections are bigger than the susceptible population
+    df[, asymptomatic := asymptomatic + newInfections] # set the initial infection size
+    df[, susceptible := susceptible - newInfections] # adjust the susceptible population for the new infections
+    
+    # 4 - store the current infection state
+    df[uninfectedIdx[newInfections>0], year_infected := year] # record the year of infection
+    mAsym[,year] = df[,asymptomatic]
+    mInf1[,year] = df[,infected1]
+    mInf2[,year] = df[,infected2] 
+    mInf3[,year] = df[,infected3] 
+    mInf[,year]  = df[,infected] 
+    mRem[,year]  = df[,removed]
+    
+        }
+    message("    Detection history...")
+    print(table(df[,year_detected]))
+    
+
+  message("     Done spread simulation at ", Sys.time(),
+          " - ", round(sum(df[,asymptomatic+infected+infected1+infected2+infected3+removed]),1), " trees in ", 
+          sum(df[,asymptomatic+infected+infected1+infected2+infected3+removed]>0), " grid cells infected")
+  
+  ############### record and output state of the infection
+  # prevalence, number of infectious symptomatics, total number of infected, cells infected 
+
+  df[,("prev") := (asymptomatic+infected+infected1+infected2+infected3+removed)/(susceptible+asymptomatic+infected+infected1+infected2+infected3+removed)*100]
+  df[,("inf_I") := (infected+infected1+infected2+infected3)]
+  df[,("inf_tot") := (asymptomatic+infected+infected1+infected2+infected3+removed)]
+  df[,("inf_cell") := ifelse(prev>0,1,0)]
+  
+  # reduce the output to print output only with the infected cells to reduce file size
+  df2<-df[,c("x","y", "county","susceptible","asymptomatic", "inf_I","removed","inf_tot","prev", "inf_cell", "year_infected")]
+  out<-df2[asymptomatic+inf_I+removed>0,]
+  out$Tinf_cell<-nrow(out) 
+  out$sim= SIMID+(repID-1) # print the index to identify the simulation
+  
+  
+  return(out)
+
+}
+
+
+res=sim_spread(simID=SIMID) # launch simulation 
+saveRDS(res,outfile) # save outfile in .rds format (plain text type of file, R object ready to be loaded in R)
+
